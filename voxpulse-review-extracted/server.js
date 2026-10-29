@@ -82,6 +82,13 @@ app.use(session({
 }));
 app.use("/api", rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
+const ivrUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
+const ivrDir = path.join(__dirname, "public", "uploads", "ivr");
+fs.mkdirSync(ivrDir, { recursive: true });
+for (const [column, definition] of [["caller_ids", "TEXT NOT NULL DEFAULT '[]'"], ["ivr_path", "TEXT NOT NULL DEFAULT ''"]]) {
+ try { db.exec("ALTER TABLE campaigns ADD COLUMN " + column + " " + definition); }
+ catch (e) { if (!String(e.message).includes("duplicate column")) throw e; }
+}
 
 function requireAuth(req, res, next) {
  if (!req.session.user) return res.status(401).json({ error: "Please sign in." });
@@ -92,6 +99,15 @@ function audit(campaignId, kind, detail = "") {
 }
 function cleanText(v, max = 120) { return String(v ?? "").trim().slice(0, max); }
 function safeCampaign(row) { return row; }
+function parseCallerIds(value, fallback = "") {
+ let list = Array.isArray(value) ? value : (String(value ?? fallback).trim().startsWith("[") ? (() => { try { return JSON.parse(value ?? fallback); } catch { return []; } })() : String(value ?? fallback).split(/[\\n,;]+/));
+ return [...new Set(list.map(x => String(x || "").trim().replace(/[\\s().-]/g, "")).filter(x => /^\\+?[0-9]{7,15}$/.test(x)))].slice(0,100);
+}
+function campaignApi(row) {
+ if (!row) return row;
+ let ids=[]; try { ids=JSON.parse(row.caller_ids || "[]"); } catch {}
+ return {...row, caller_ids: ids.length ? ids : (row.caller_id ? [row.caller_id] : []), ivr_url: row.ivr_path || ""};
+}
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, callsEnabled: process.env.CALLS_ENABLED === "true", version: "0.1.0" }));
 app.get("/api/session", (req, res) => res.json({ authenticated: !!req.session.user, username: req.session.user || null, setupRequired: !authReady }));
@@ -126,10 +142,12 @@ app.post("/api/campaigns", requireAuth, (req, res) => {
  const max = Math.max(1, Math.min(500, Number(process.env.MAX_CHANNELS_PER_CAMPAIGN || 10)));
  if (!Number.isInteger(channels) || channels < 1 || channels > max) return res.status(400).json({ error: `Channels must be between 1 and ${max} for this server configuration.` });
  if (!Number.isInteger(ring) || ring < 5 || ring > 120 || !Number.isInteger(answer) || answer < 1 || answer > 7200) return res.status(400).json({ error: "Ring time must be 5–120 seconds; answer time 1–7200 seconds." });
- const info = db.prepare("INSERT INTO campaigns(name,provider,message,lead_list,caller_id,channels,ring_time,answer_time) VALUES(?,?,?,?,?,?,?,?)")
- .run(name, cleanText(b.provider || "IDT", 80), cleanText(b.message, 160), cleanText(b.lead_list, 160), cleanText(b.caller_id, 40), channels, ring, answer);
+ const callerIds = parseCallerIds(b.caller_ids ?? b.caller_id);
+ if ((b.caller_ids || b.caller_id) && !callerIds.length) return res.status(400).json({error:"Enter valid caller IDs (7–15 digits, optional +), separated by commas or new lines."});
+ const info = db.prepare("INSERT INTO campaigns(name,provider,message,lead_list,caller_id,caller_ids,channels,ring_time,answer_time) VALUES(?,?,?,?,?,?,?,?,?)")
+ .run(name, cleanText(b.provider || "IDT", 80), cleanText(b.message, 160), cleanText(b.lead_list, 160), callerIds[0] || "", JSON.stringify(callerIds), channels, ring, answer);
  audit(info.lastInsertRowid, "campaign_created", name);
- res.status(201).json(db.prepare("SELECT * FROM campaigns WHERE id=?").get(info.lastInsertRowid));
+ res.status(201).json(campaignApi(db.prepare("SELECT * FROM campaigns WHERE id=?").get(info.lastInsertRowid)));
 });
 app.patch("/api/campaigns/:id", requireAuth, (req, res) => {
  const id = Number(req.params.id);
@@ -143,10 +161,12 @@ app.patch("/api/campaigns/:id", requireAuth, (req, res) => {
  if (!Number.isInteger(channels) || channels < 1 || channels > max || !Number.isInteger(ring) || ring < 5 || ring > 120 || !Number.isInteger(answer) || answer < 1 || answer > 7200) return res.status(400).json({ error: "Invalid channel or timer value." });
  const name = cleanText(b.name ?? old.name, 100);
  if (!name) return res.status(400).json({ error: "Campaign name is required." });
- db.prepare("UPDATE campaigns SET name=?,provider=?,message=?,lead_list=?,caller_id=?,channels=?,ring_time=?,answer_time=? WHERE id=?")
- .run(name, cleanText(b.provider ?? old.provider, 80), cleanText(b.message ?? old.message, 160), cleanText(b.lead_list ?? old.lead_list, 160), cleanText(b.caller_id ?? old.caller_id, 40), channels, ring, answer, id);
+ const callerIds = b.caller_ids === undefined && b.caller_id === undefined ? parseCallerIds(old.caller_ids, old.caller_id) : parseCallerIds(b.caller_ids ?? b.caller_id);
+ if ((b.caller_ids || b.caller_id) && !callerIds.length) return res.status(400).json({error:"Enter valid caller IDs (7–15 digits, optional +), separated by commas or new lines."});
+ db.prepare("UPDATE campaigns SET name=?,provider=?,message=?,lead_list=?,caller_id=?,caller_ids=?,channels=?,ring_time=?,answer_time=? WHERE id=?")
+ .run(name, cleanText(b.provider ?? old.provider, 80), cleanText(b.message ?? old.message, 160), cleanText(b.lead_list ?? old.lead_list, 160), callerIds[0] || "", JSON.stringify(callerIds), channels, ring, answer, id);
  audit(id, "campaign_updated", name);
- res.json(db.prepare("SELECT * FROM campaigns WHERE id=?").get(id));
+ res.json(campaignApi(db.prepare("SELECT * FROM campaigns WHERE id=?").get(id)));
 });
 app.post("/api/campaigns/:id/action", requireAuth, (req, res) => {
  const id = Number(req.params.id), action = cleanText(req.body?.action, 20);
@@ -167,6 +187,19 @@ app.post("/api/campaigns/:id/action", requireAuth, (req, res) => {
    return res.json({ ok: true });
  } else return res.status(400).json({ error: "Unsupported action." });
  res.json(db.prepare("SELECT * FROM campaigns WHERE id=?").get(id));
+});
+app.post("/api/campaigns/:id/ivr", requireAuth, ivrUpload.single("file"), (req,res) => {
+ const id=Number(req.params.id), c=db.prepare("SELECT id,ivr_path FROM campaigns WHERE id=?").get(id);
+ if(!c) return res.status(404).json({error:"Campaign not found."});
+ if(!req.file) return res.status(400).json({error:"Choose an audio file."});
+ const ext=({"audio/mpeg":".mp3","audio/wav":".wav","audio/x-wav":".wav","audio/ogg":".ogg","audio/mp4":".m4a","audio/aac":".aac"})[req.file.mimetype];
+ if(!ext) return res.status(400).json({error:"Use MP3, WAV, OGG, M4A or AAC audio."});
+ const filename="campaign-"+id+"-"+crypto.randomBytes(8).toString("hex")+ext;
+ fs.writeFileSync(path.join(ivrDir,filename),req.file.buffer,{flag:"wx",mode:0o640});
+ const url="/uploads/ivr/"+filename;
+ db.prepare("UPDATE campaigns SET ivr_path=? WHERE id=?").run(url,id);
+ audit(id,"ivr_audio_uploaded",filename);
+ res.json({ok:true,ivr_url:url});
 });
 app.post("/api/campaigns/:id/leads", requireAuth, upload.single("file"), (req, res) => {
  const id = Number(req.params.id);
